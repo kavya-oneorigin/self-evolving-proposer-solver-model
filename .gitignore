@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+venv/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+
+# Ignore PDF files used for testing
+*.pdf
