@@ -14,3 +14,8 @@ venv/
 
 # Ignore PDF files used for testing
 *.pdf
+
+# Checkpoint files (per-iteration few-shot data)
+checkpoints/
+
+response/*
