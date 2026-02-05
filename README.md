@@ -91,9 +91,32 @@ Each extraction run = one iteration:
 ```
 checkpoints/
 ├── manifest.json       # Current iteration and model names
-├── iter_1.json         # Checkpoint from 1st extraction
-├── iter_2.json         # Checkpoint from 2nd extraction
+├── iter_1.json         # Checkpoint from 1st extraction (with scores)
+├── iter_2.json         # Checkpoint from 2nd extraction (with scores)
 └── ...
 ```
 
-Each checkpoint file contains a snippet of the source text and the final extracted JSON, used as a few-shot example for future runs.
+Each checkpoint file contains a snippet of the source text, the final extracted JSON, and reward scores.
+
+## Reward System
+
+Inspired by Dr.Zero, both models are scored after each extraction to measure quality and track improvement.
+
+**Solver score** (two components, 50/50):
+
+| Component | What it measures | Scoring |
+|---|---|---|
+| JSON validity | Is the output valid JSON? | 1.0 = yes, 0.0 = no |
+| Completeness | How quickly did the Proposer approve? | Round 1 = 1.0, Round 2 = 0.67, Round 3 = 0.33, never = 0.0 |
+
+**Proposer score** (two components, 50/50):
+
+| Component | What it measures | Scoring |
+|---|---|---|
+| Format validity | Did it give clear structured feedback or a clean DONE? | 1.0 = clear, 0.5 = vague |
+| Impact | When it flagged issues, did the Solver's output actually change? | Higher change = higher score |
+
+**How scores are used:**
+- Only extractions with a Solver score >= 0.5 are saved as checkpoints (keeps few-shot examples high quality)
+- When loading checkpoints, the highest-scored ones are preferred over the most recent
+- Scores are logged after each run and saved inside each checkpoint file for tracking improvement over time

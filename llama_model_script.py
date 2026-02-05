@@ -21,6 +21,8 @@ MANIFEST_PATH = os.path.join(CHECKPOINTS_DIR, "manifest.json")
 SNIPPET_MAX_CHARS = 1500
 # How many previous checkpoints to use as few-shot examples
 MAX_FEWSHOT_EXAMPLES = 2
+# Minimum solver score required to save a checkpoint
+MIN_CHECKPOINT_SCORE = 0.5
 
 SOLVER_SYSTEM_PROMPT = (
     "You are a data extraction specialist. Your sole job is to extract every factual "
@@ -75,14 +77,17 @@ def save_manifest(manifest: dict):
 # Checkpoint save / load
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(iteration: int, pdf_name: str, text_snippet: str, extracted_json: str):
-    """Save a checkpoint after a successful extraction."""
+def save_checkpoint(iteration: int, pdf_name: str, text_snippet: str, extracted_json: str,
+                    solver_score: dict, proposer_score: dict):
+    """Save a checkpoint after a successful extraction, including reward scores."""
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     checkpoint = {
         "iteration": iteration,
         "pdf_name": pdf_name,
         "text_snippet": text_snippet[:SNIPPET_MAX_CHARS],
         "extracted_json": extracted_json,
+        "solver_score": solver_score,
+        "proposer_score": proposer_score,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     path = os.path.join(CHECKPOINTS_DIR, f"iter_{iteration}.json")
@@ -92,7 +97,7 @@ def save_checkpoint(iteration: int, pdf_name: str, text_snippet: str, extracted_
 
 
 def load_checkpoints(max_examples: int = MAX_FEWSHOT_EXAMPLES) -> list[dict]:
-    """Load the most recent checkpoint files for few-shot context."""
+    """Load the highest-scored checkpoint files for few-shot context."""
     if not os.path.isdir(CHECKPOINTS_DIR):
         return []
 
@@ -101,22 +106,28 @@ def load_checkpoints(max_examples: int = MAX_FEWSHOT_EXAMPLES) -> list[dict]:
     for fname in os.listdir(CHECKPOINTS_DIR):
         if fname.startswith("iter_") and fname.endswith(".json"):
             try:
-                n = int(fname.replace("iter_", "").replace(".json", ""))
-                checkpoint_files.append((n, fname))
+                int(fname.replace("iter_", "").replace(".json", ""))
+                checkpoint_files.append(fname)
             except ValueError:
                 continue
 
-    # Sort by iteration number (descending) and take the most recent
-    checkpoint_files.sort(key=lambda x: x[0], reverse=True)
-    checkpoints = []
-    for _, fname in checkpoint_files[:max_examples]:
+    # Load all checkpoints and sort by solver score (highest first)
+    all_checkpoints = []
+    for fname in checkpoint_files:
         path = os.path.join(CHECKPOINTS_DIR, fname)
         with open(path, 'r', encoding='utf-8') as f:
-            checkpoints.append(json.load(f))
+            cp = json.load(f)
+            all_checkpoints.append(cp)
 
-    # Reverse so oldest example comes first (chronological order)
-    checkpoints.reverse()
-    return checkpoints
+    all_checkpoints.sort(
+        key=lambda cp: cp.get("solver_score", {}).get("total", 0.0),
+        reverse=True,
+    )
+
+    # Take the best ones, then sort by iteration order for chronological context
+    best = all_checkpoints[:max_examples]
+    best.sort(key=lambda cp: cp.get("iteration", 0))
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +169,79 @@ def build_fewshot_proposer_messages(checkpoints: list[dict]) -> list[dict]:
             "content": "DONE",
         })
     return messages
+
+
+# ---------------------------------------------------------------------------
+# Reward scoring
+# ---------------------------------------------------------------------------
+
+def score_solver(extraction: str, rounds_needed: int, proposer_approved: bool) -> dict:
+    """Score the Solver's extraction quality.
+
+    Components (50/50):
+      - json_valid:   1.0 if output is parseable JSON, 0.0 otherwise.
+      - completeness: How quickly the Proposer approved.
+                      Round 1 DONE = 1.0, Round 2 = 0.67, Round 3 = 0.33, never = 0.0.
+    """
+    # JSON validity
+    json_valid = 0.0
+    try:
+        json.loads(extraction)
+        json_valid = 1.0
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Completeness
+    if proposer_approved:
+        completeness = round(max(0.0, 1.0 - (rounds_needed - 1) / 3), 2)
+    else:
+        completeness = 0.0
+
+    total = round(0.5 * json_valid + 0.5 * completeness, 2)
+    return {"json_valid": json_valid, "completeness": completeness, "total": total}
+
+
+def score_proposer(audit_rounds: list[dict]) -> dict:
+    """Score the Proposer's audit quality.
+
+    Per round, two components (50/50):
+      - format_valid: Did it say DONE or list specific issues?
+      - impact:       If it flagged issues, did the extraction actually change?
+
+    Returns the average across all rounds.
+    """
+    if not audit_rounds:
+        return {"format_valid": 0.0, "impact": 0.0, "total": 0.0}
+
+    round_scores = []
+    for rd in audit_rounds:
+        feedback = rd["feedback"]
+        is_done = "DONE" in feedback.upper()
+
+        # Format validity: DONE or numbered/bulleted list of issues
+        has_list = any(line.strip().startswith(("-", "*")) or
+                       (len(line.strip()) > 1 and line.strip()[0].isdigit() and line.strip()[1] in ".)")
+                       for line in feedback.split("\n") if line.strip())
+        format_valid = 1.0 if (is_done or has_list) else 0.5
+
+        # Impact: did the Solver's output actually change after this feedback?
+        if is_done:
+            impact = 1.0  # Approving a good extraction is correct
+        elif rd.get("extraction_after") is not None:
+            before_len = len(rd["extraction_before"])
+            after_len = len(rd["extraction_after"])
+            change = abs(after_len - before_len)
+            impact = round(min(1.0, change / max(before_len * 0.05, 1)), 2)
+        else:
+            impact = 0.0
+
+        total = round(0.5 * format_valid + 0.5 * impact, 2)
+        round_scores.append({"format_valid": format_valid, "impact": impact, "total": total})
+
+    avg_total = round(sum(r["total"] for r in round_scores) / len(round_scores), 2)
+    avg_format = round(sum(r["format_valid"] for r in round_scores) / len(round_scores), 2)
+    avg_impact = round(sum(r["impact"] for r in round_scores) / len(round_scores), 2)
+    return {"format_valid": avg_format, "impact": avg_impact, "total": avg_total, "rounds": round_scores}
 
 
 # ---------------------------------------------------------------------------
@@ -273,29 +357,58 @@ def iterative_extraction(pdf_path: str, solver_model: str, proposer_model: str,
         extraction = solver_extract(solver_model, full_text, solver_messages, options)
 
         # --- STEP 2: Proposer audits, Solver refines ---
+        audit_rounds = []
+        proposer_approved = False
+        rounds_needed = 0
+
         for i in range(3):
-            logging.info(f"--- Proposer: Audit Round {i+1} ---")
+            rounds_needed = i + 1
+            logging.info(f"--- Proposer: Audit Round {rounds_needed} ---")
+            extraction_before = extraction
             feedback = proposer_audit(proposer_model, full_text, extraction, proposer_messages, options)
 
             if "DONE" in feedback.upper():
                 logging.info("Proposer validated extraction as complete.")
+                proposer_approved = True
+                audit_rounds.append({
+                    "feedback": feedback,
+                    "extraction_before": extraction_before,
+                    "extraction_after": None,
+                })
                 break
             else:
                 logging.warning("Proposer found missing info. Sending feedback to Solver...")
-                logging.info(f"--- Solver: Refinement Round {i+1} ---")
+                logging.info(f"--- Solver: Refinement Round {rounds_needed} ---")
                 extraction = solver_refine(solver_model, feedback, solver_messages, options)
+                audit_rounds.append({
+                    "feedback": feedback,
+                    "extraction_before": extraction_before,
+                    "extraction_after": extraction,
+                })
 
-        # --- STEP 3: Save checkpoint ---
+        # --- STEP 3: Compute reward scores ---
+        s_score = score_solver(extraction, rounds_needed, proposer_approved)
+        p_score = score_proposer(audit_rounds)
+
+        logging.info(f"Solver score:   {s_score['total']} "
+                     f"(json_valid={s_score['json_valid']}, completeness={s_score['completeness']})")
+        logging.info(f"Proposer score: {p_score['total']} "
+                     f"(format={p_score['format_valid']}, impact={p_score['impact']})")
+
+        # --- STEP 4: Save checkpoint (only if quality is sufficient) ---
         manifest = load_manifest()
         next_iter = manifest["current_iteration"] + 1
         pdf_name = os.path.basename(pdf_path)
 
-        save_checkpoint(next_iter, pdf_name, full_text, extraction)
+        if s_score["total"] >= MIN_CHECKPOINT_SCORE:
+            save_checkpoint(next_iter, pdf_name, full_text, extraction, s_score, p_score)
+            manifest["current_iteration"] = next_iter
+            save_manifest(manifest)
+            logging.info(f"Iteration {next_iter} complete.")
+        else:
+            logging.warning(f"Solver score {s_score['total']} < {MIN_CHECKPOINT_SCORE}. "
+                            f"Checkpoint NOT saved (low quality extraction).")
 
-        manifest["current_iteration"] = next_iter
-        save_manifest(manifest)
-
-        logging.info(f"Iteration {next_iter} complete.")
         return extraction
 
     except ollama.ResponseError as e:
