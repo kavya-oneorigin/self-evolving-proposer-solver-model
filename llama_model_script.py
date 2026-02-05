@@ -30,6 +30,7 @@ SOLVER_SYSTEM_PROMPT = (
     "Rules:\n"
     "- Extract ALL facts: names, dates, grades, scores, course codes, institutions, "
     "and any other concrete data points.\n"
+    "- Use standard English for all JSON field names (e.g., \"studentName\", \"courseId\").\n"
     "- Output ONLY valid JSON. No commentary, no markdown fences, no explanations outside the JSON.\n"
     "- Preserve exact values from the source. Never paraphrase numbers, dates, or proper nouns.\n"
     "- If a field is present in the text, it must appear in your JSON. Completeness is your top priority."
@@ -413,7 +414,9 @@ def iterative_extraction(pdf_path: str, solver_model: str, proposer_model: str,
 
     except ollama.ResponseError as e:
         logging.error(f"Ollama API error: {e.error}")
-        logging.error(f"Are the ollama models '{solver_model}' and '{proposer_model}' available? Run: bash setup_models.sh")
+        if "not found" in e.error:
+            logging.error(f"The model '{solver_model}' or '{proposer_model}' was not found by the Ollama server.")
+            logging.error("Please ensure the models are created by running: bash setup_models.sh")
         sys.exit(1)
     except Exception as e:
         logging.error(f"An unexpected error occurred during extraction: {e}")
